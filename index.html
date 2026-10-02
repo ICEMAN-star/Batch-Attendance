@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#17365d">
+<title>تسجيل الحضور</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f4f7fb;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.card{background:white;width:min(92%,430px);padding:28px;border-radius:18px;box-shadow:0 8px 30px #0001;text-align:center}
+h1{font-size:24px;margin:0 0 12px;color:#17365d} p{line-height:1.7;color:#555}
+button{border:0;border-radius:12px;padding:14px 22px;font-size:16px;cursor:pointer;background:#17365d;color:white;margin:5px}
+button:disabled{opacity:.6}.secondary{background:#777}.save{background:#176b3a}
+input{width:90%;box-sizing:border-box;padding:12px;border:1px solid #ccc;border-radius:10px;font-size:16px;margin:6px 0;text-align:right}
+#status{margin-top:18px;font-weight:bold}.ok{color:green}.err{color:#b00020}.info{color:#17365d}
+small{display:block;margin-top:18px;color:#777;line-height:1.6}.hidden{display:none}
+.badge{margin-top:12px;padding:8px;border-radius:8px;background:#f1f4f8;color:#555}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 id="title">تسجيل الحضور</h1>
+  <p>يجب السماح بالوصول إلى موقعك للتحقق من وجودك داخل نطاق الكلية.</p>
+  <div id="offlineState" class="badge">جاري تجهيز النظام...</div>
+  <button id="check">التحقق من الموقع</button>
+
+  <div id="attendanceForm" class="hidden">
+    <p class="ok">تم التحقق من موقعك داخل النطاق.</p>
+    <input id="studentId" inputmode="numeric" autocomplete="off" placeholder="الرقم الجامعي">
+    <input id="studentName" autocomplete="off" placeholder="اسم الطالب/الطالبة">
+    <button id="save" class="save">تسجيل الحضور</button>
+  </div>
+
+  <button id="sync" class="secondary">مزامنة التسجيلات</button>
+  <button id="testMode" type="button" class="secondary hidden">وضع الاختبار</button>
+  <div id="status"></div>
+  <small>النطاق المسموح: 150 مترًا من موقع الكلية المحدد.</small>
+  <small id="pendingCount"></small>
+</div>
+<script>
+const TARGET_LAT = 13.571698;
+const TARGET_LON = 43.981730;
+const ALLOWED_RADIUS_METERS = 150;
+const SYNC_URL = "https://script.google.com/macros/s/AKfycbxPYwMsUJ8sqjU_LXLuCsva4nhXabF8NB-5osHEP3vlzA0_YpvVRA1XR6dCERlf3qc/exec";
+const DB_NAME = "TaizAttendanceDB";
+const DB_VERSION = 1;
+const STORE = "attendance";
+const statusEl = document.getElementById("status");
+const checkBtn = document.getElementById("check");
+const formEl = document.getElementById("attendanceForm");
+const saveBtn = document.getElementById("save");
+const syncBtn = document.getElementById("sync");
+const pendingEl = document.getElementById("pendingCount");
+const offlineEl = document.getElementById("offlineState");
+const testBtn = document.getElementById("testMode");
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', async () => {
+    try {
+      // تسجيل الـService Worker فقط. لا نستدعي reg.update() هنا،
+      // لأن محاولة التحديث أثناء عدم وجود الإنترنت قد تجعل الرسالة تبدو كأن Offline فشل.
+      const reg = await navigator.serviceWorker.register('./sw.js');
+      offlineEl.textContent = '✅ تم تجهيز النظام للعمل بدون إنترنت';
+      offlineEl.className = 'badge ok';
+
+      // إذا كان النظام مثبتًا بالفعل، يمكن محاولة التحديث في الخلفية،
+      // لكن فشل التحديث بسبب انقطاع الإنترنت لا يعني أن النسخة المحلية غير جاهزة.
+      reg.update().catch(() => {});
+    } catch(e) {
+      offlineEl.textContent = '⚠️ لم يتم تجهيز وضع عدم الاتصال';
+      offlineEl.className = 'badge err';
+    }
+  });
+} else {
+  offlineEl.textContent = '⚠️ هذا المتصفح لا يدعم وضع عدم الاتصال';
+}
+
+function openDB(){
+ return new Promise((resolve,reject)=>{
+  const req=indexedDB.open(DB_NAME,DB_VERSION);
+  req.onupgradeneeded=()=>{const db=req.result;if(!db.objectStoreNames.contains(STORE))db.createObjectStore(STORE,{keyPath:'id',autoIncrement:true});};
+  req.onsuccess=()=>resolve(req.result); req.onerror=()=>reject(req.error);
+ });
+}
+async function addRecord(record){const db=await openDB();return new Promise((res,rej)=>{const tx=db.transaction(STORE,'readwrite');tx.objectStore(STORE).add(record);tx.oncomplete=res;tx.onerror=()=>rej(tx.error);});}
+async function getRecords(){const db=await openDB();return new Promise((res,rej)=>{const tx=db.transaction(STORE,'readonly');const r=tx.objectStore(STORE).getAll();r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+async function deleteRecord(id){const db=await openDB();return new Promise((res,rej)=>{const tx=db.transaction(STORE,'readwrite');tx.objectStore(STORE).delete(id);tx.oncomplete=res;tx.onerror=()=>rej(tx.error);});}
+async function updateCount(){const rows=await getRecords();pendingEl.textContent=`التسجيلات المحفوظة محليًا ولم تُرسل: ${rows.length}`;}
+
+function distanceMeters(lat1,lon1,lat2,lon2){const R=6371000,toRad=x=>x*Math.PI/180,dLat=toRad(lat2-lat1),dLon=toRad(lon2-lon1),a=Math.sin(dLat/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;return 2*R*Math.asin(Math.sqrt(a));}
+
+checkBtn.addEventListener('click',()=>{
+ statusEl.className='info';statusEl.textContent='جاري التحقق من موقعك...';checkBtn.disabled=true;
+ if(!navigator.geolocation){statusEl.className='err';statusEl.textContent='هذا الجهاز لا يدعم تحديد الموقع.';checkBtn.disabled=false;return;}
+ navigator.geolocation.getCurrentPosition(pos=>{
+  const lat=pos.coords.latitude,lon=pos.coords.longitude,accuracy=pos.coords.accuracy||9999;
+  const distance=distanceMeters(lat,lon,TARGET_LAT,TARGET_LON);
+  if(accuracy>ALLOWED_RADIUS_METERS){statusEl.className='err';statusEl.textContent=`دقة الموقع الحالية حوالي ${Math.round(accuracy)} متر. فعّل الموقع بدقة عالية وحاول مرة أخرى.`;checkBtn.disabled=false;return;}
+  if(distance<=ALLOWED_RADIUS_METERS){
+   statusEl.className='ok';statusEl.textContent='تم التحقق من موقعك. يمكنك تسجيل الحضور.';formEl.classList.remove('hidden');
+   formEl.dataset.lat=lat;formEl.dataset.lon=lon;formEl.dataset.accuracy=accuracy;
+  }else{statusEl.className='err';statusEl.textContent=`أنت خارج نطاق الحضور بحوالي ${Math.round(distance)} متر.`;checkBtn.disabled=false;}
+ },err=>{statusEl.className='err';statusEl.textContent=err.code===1?'تم رفض إذن الموقع. اسمح للموقع من إعدادات المتصفح ثم حاول مرة أخرى.':err.code===2?'تعذر تحديد موقعك. فعّل GPS/الموقع وحاول مرة أخرى.':'انتهت مهلة تحديد الموقع. حاول مرة أخرى.';checkBtn.disabled=false;},{enableHighAccuracy:true,timeout:15000,maximumAge:0});
+});
+
+saveBtn.addEventListener('click',async()=>{
+ const studentId=document.getElementById('studentId').value.trim(),name=document.getElementById('studentName').value.trim();
+ if(!studentId||!name){statusEl.className='err';statusEl.textContent='أدخل الرقم الجامعي والاسم.';return;}
+ const record={studentId,name,timestamp:new Date().toISOString(),lat:Number(formEl.dataset.lat),lon:Number(formEl.dataset.lon),accuracy:Number(formEl.dataset.accuracy),online:navigator.onLine,deviceId:getDeviceId()};
+ await addRecord(record);statusEl.className='ok';statusEl.textContent=navigator.onLine?'تم حفظ الحضور محليًا، وجارٍ محاولة المزامنة.':'تم حفظ الحضور في الهاتف. سيتم إرساله عند عودة الإنترنت.';
+ document.getElementById('studentId').value='';document.getElementById('studentName').value='';await updateCount();if(navigator.onLine)syncRecords();
+});
+
+function getDeviceId(){let id=localStorage.getItem('taiz_device_id');if(!id){id=crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random();localStorage.setItem('taiz_device_id',id);}return id;}
+
+async function syncRecords(){
+ const rows=await getRecords();if(!rows.length){await updateCount();return;}
+ if(!navigator.onLine){statusEl.className='info';statusEl.textContent='لا يوجد إنترنت. ستبقى البيانات محفوظة.';return;}
+ let sent=0;
+ for(const row of rows){
+  try{
+   const payload={...row};delete payload.id;
+   const r=await fetch(SYNC_URL,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(payload)});
+   if(r.ok){await deleteRecord(row.id);sent++;}
+  }catch(e){break;}
+ }
+ await updateCount();statusEl.className=sent?'ok':'info';statusEl.textContent=sent?`تمت مزامنة ${sent} تسجيلات بنجاح.`:'تعذر الاتصال بالسيرفر. ستبقى البيانات محفوظة.';
+}
+syncBtn.addEventListener('click',syncRecords);
+window.addEventListener('online',syncRecords);
+updateCount();
+
+// وضع الاختبار المخفي: اضغط عنوان الصفحة 5 مرات خلال 3 ثوانٍ.
+let clicks=0,timer;document.getElementById('title').addEventListener('click',()=>{clicks++;clearTimeout(timer);timer=setTimeout(()=>clicks=0,3000);if(clicks>=5){testBtn.classList.remove('hidden');statusEl.textContent='تم إظهار وضع الاختبار.';clicks=0;}});
+testBtn.addEventListener('click',()=>{formEl.classList.remove('hidden');formEl.dataset.lat=TARGET_LAT;formEl.dataset.lon=TARGET_LON;formEl.dataset.accuracy=10;statusEl.className='info';statusEl.textContent='وضع الاختبار: تم تجاوز فحص GPS فقط.';});
+</script>
+</body>
+</html>
